@@ -1,260 +1,105 @@
-# Dragonwilds Server Manager
+# Dragonwilds Server Manager 3
 
-`DragonwildsManager.exe` is a Windows desktop app for installing, configuring, updating, launching, and monitoring a RuneScape: Dragonwilds dedicated server.
+A Windows desktop manager for RuneScape: Dragonwilds dedicated servers, built on [Obietek's original project](https://github.com/Obietek/DragonWilds-Dedicated-Server-Setup).
 
-It is built from this project with PyInstaller and outputs a single executable at `dist\DragonwildsManager.exe`.
+## What's new
 
-## Screenshots
+- Modern charcoal interface with rounded controls, blue-violet accents, compact icon navigation, a connection screen and a focused server dashboard.
+- Overview, Server settings, Automation, Backups and Activity pages.
+- Steam public-build checks; automatic installation only when the build changes.
+- Automatic updates wait for 60 seconds with no players by default. Unknown activity defers maintenance.
+- Optional daily maintenance window, including windows spanning midnight.
+- Scheduled ZIP backups, integrity verification, SHA-256 inventories and retention per installation.
+- Required backups before updates, repairs and restarts, plus a stopped snapshot before updating an online server.
+- Serialized operations, streaming SteamCMD output, timeouts, retries, persistent schedules and rotating logs.
+- Installation-specific process tracking, PID reuse protection, shutdown requests and an optional forced-stop fallback.
+- Configuration editing preserves comments, game-managed admin lists and unrelated settings, with `.ini.bak` copies.
 
-### Status Tab
+Automatic updates, scheduled backups and forced stops are **off by default**. Opening the manager does not install, launch, update or stop a server. This version does not expose the old destructive Delete Server Files action.
 
-![Status tab](docs/images/status-tab.png)
+## Run or build
 
-### Setup Tab
-
-![Setup tab](docs/images/setup-tab.png)
-
-### Config Tab
-
-![Config tab](docs/images/config-tab.png)
-
-### Server Console
-
-![Server console](docs/images/server-console.png)
-
-## What It Does
-
-The app provides a simple GUI for common dedicated-server tasks:
-
-- Install SteamCMD
-- Download or update the Dragonwilds dedicated server files
-- Edit and save `DedicatedServer.ini`
-- Create Windows Firewall UDP rules
-- Start and stop the dedicated server
-- Monitor server status, PID, uptime, and live app log output
-- Delete the configured server install folder
-
-## Build Output
-
-Run:
+Use Python 3.12 or later:
 
 ```powershell
+python -m pip install -r requirements.txt
 python build.py
 ```
 
-This creates:
+Open **dist/DragonwildsManager.exe**. The executable at the repository root is the original upstream binary; the new build is in **dist**. Run from source with `python main.py`.
 
-```text
-dist\DragonwildsManager.exe
-```
+Administrator rights are only needed for the explicit Configure firewall action or access to an elevated server process.
 
-The build script also installs the required Python packages:
+## Connect an existing server without reinstalling
 
-- `psutil`
-- `pyinstaller`
+1. In Server settings, browse to the existing `RSDragonwildsServer.exe` launcher, not the executable inside `Binaries/Win64`.
+2. The install folder follows the launcher's folder and existing configuration is loaded into the form. Use Save changes to store manager preferences.
+3. Saving preferences does not rewrite game configuration. Do not use Install / repair just to connect an existing installation.
+4. Choose a backup folder outside the game's Saved folders and create a manual backup.
+5. Enable the desired schedules in Automation, then save settings.
 
-## Running The Exe
+Use one manager per server. An already-running server is discovered without being restarted. A server launched elsewhere is not assumed to own an isolated console: if safe shutdown cannot be requested, maintenance stops with an explanation. At a convenient maintenance time, stop it using its existing controls and start it through this manager for managed console shutdown. Forced stops are optional and may lose unsaved progress.
 
-1. Build the project with `python build.py`.
-2. Open the `dist` folder.
-3. Run `DragonwildsManager.exe`.
-4. For firewall changes, run it as Administrator.
+For a new installation: select a folder, save settings, run Install / repair, fill in the world configuration, save settings, then Write game config before first launch. Configure the firewall explicitly if needed; router forwarding is separate.
 
-The executable is built with `--noconsole`, so it launches as a normal Windows app without a terminal window.
+## Automation
 
-## Windows Security Warnings
+| Setting | Default |
+| --- | --- |
+| Automatic update checks and installation | Off |
+| Update interval | 60 minutes |
+| Wait for an empty server | On; 60 seconds |
+| Daily maintenance window | Off; optional 03:00–05:00 local time |
+| Scheduled backups | Off |
+| Backup interval | 6 hours |
+| Archives retained per installation | 20 |
+| Forced-stop fallback | Off |
 
-Because the executable may be unsigned, Windows can show warnings such as `Unknown publisher` or a Microsoft Defender SmartScreen prompt.
+Schedules run while the manager is open and Windows is awake, including while minimized. Closing it pauses automation and leaves the server running. This is a desktop scheduler, not a Windows service. Use `DragonwildsManager.exe --minimized` for a minimized launch; a shortcut with that argument can be placed in your Windows Startup folder.
 
-If Windows blocks the app:
+Next-run times survive app restarts. A missed job runs once after reopening or waking; missed intervals are not replayed as a burst. Failed jobs retry within 15 minutes. Deferred updates check again in 5 minutes. Only one operation runs at a time.
 
-1. Click `More info`.
-2. Click `Run anyway`.
+Checks use SteamCMD `app_info_update` and `app_info_print`, comparing the public branch build with the installation's `appmanifest_4019830.acf`. Legacy `steamapps/common` layouts are supported when the manifest names the matching folder. Unknown metadata is never reported as up to date; an unknown installed build never triggers automatic installation. SteamCMD is downloaded into the installation's steamcmd subfolder when needed.
 
-If Windows marks the downloaded file as blocked:
+Updates preserve the previous running state. Backup or shutdown failure cancels maintenance. If the stopped snapshot fails before Steam modifies files, the unchanged server is restarted. Once installation begins, an install or build-verification failure leaves the server stopped for investigation. A started process is reported separately from world readiness.
 
-1. Right-click `DragonwildsManager.exe`.
-2. Click `Properties`.
-3. On the `General` tab, check `Unblock` if it appears.
-4. Click `Apply`, then run the app again.
+Player activity is inferred from startup, join and leave events in the server log. Missing, stale, truncated or unreadable startup information defers automatic updates under the empty-server policy. This is conservative log-based detection, not a game-supported player-count API. A small race remains between the final activity check and shutdown.
 
-If SmartScreen or Defender quarantines the file after download:
+## Backups and recovery
 
-1. Open `Windows Security`.
-2. Go to `Virus & threat protection`.
-3. Open `Protection history`.
-4. Find the blocked `DragonwildsManager.exe` event.
-5. Choose the option to allow or restore the file if you trust the build source.
+Snapshots include existing save/configuration directories under the chosen installation, plus the current Windows user's Dragonwilds save/configuration folders. Each manifest maps archive paths to original source paths and records hashes, time, reason and whether the server was online.
 
-If you plan to redistribute the app broadly, signing the executable is strongly recommended to reduce these warnings.
+Archives are written as `.partial`, checked for source changes and ZIP integrity, then published as `.zip`. Failed or changing snapshots never become completed archives and never trigger retention. Retention applies only to completed, manager-marked archives for the same installation. Other files and other installations' archives remain untouched. Moving an installation changes its retention identity.
 
-## First-Time Setup
+Live backups capture files already written to disk; they cannot capture unsaved in-memory progress or guarantee a transaction across game saves. Maintenance takes another snapshot after exit. Keep additional copies on another disk. Archives contain configuration passwords and should be stored privately.
 
-On first launch, use the tabs in this order:
+To restore: stop the server, back up its current state, inspect the archive's `manifest.json`, and copy the desired original saves to their corresponding source folders. Preserve filenames and secure another copy before resolving conflicting newer saves. Start and verify the world. The manager does not perform destructive automatic restoration.
 
-1. `Config`
-2. `Setup`
-3. `Status`
+Jagex documents game configuration and save paths in its [dedicated server guide](https://runescapedragonwilds.help.jagex.com/hc/en-gb/articles/45365343055249-Dedicated-Servers-How-to-Guide).
 
-### Config Tab
+## Files
 
-This tab manages your server settings.
+- Preferences: `%APPDATA%/DragonwildsManager/settings.json`
+- Schedule state: `%APPDATA%/DragonwildsManager/state.json`
+- Rotating logs: `%APPDATA%/DragonwildsManager/manager.log`
+- Default backups: `%USERPROFILE%/DragonwildsBackups`
+- New executable: `dist/DragonwildsManager.exe`
 
-Fields:
+`--data-dir PATH` isolates manager preferences, schedule state and logs. It does **not** sandbox selected server or game-save paths. Tests explicitly replace game paths with temporary fixtures.
 
-- `Player ID (Owner)`: required
-- `Server Name`: required
-- `Default World Name`: required
-- `Admin Password`: required
-- `World Password`: optional
-- `Server Port`: defaults to `7777`
-
-Buttons:
-
-- `Save Configuration`: saves the values and writes `DedicatedServer.ini`
-- `Reload from File`: reloads values from existing config files
-
-The app writes config data to:
-
-- `%LOCALAPPDATA%\RSDragonwilds\Saved\Config\WindowsServer\DedicatedServer.ini`
-- `<server install>\RSDragonwilds\Saved\Config\WindowsServer\DedicatedServer.ini`
-- `<server install>\Saved\Config\WindowsServer\DedicatedServer.ini`
-
-## Setup Tab
-
-This tab handles installation and maintenance.
-
-Fields:
-
-- `Install Folder`: where server files and SteamCMD will live
-- `Existing Server Exe`: lets you point the app to an existing `RSDragonwildsServer.exe`
-
-Buttons:
-
-- `Full Setup`: downloads SteamCMD, installs server files, writes config, and applies firewall rules
-- `Firewall Only`: creates Windows Firewall UDP allow rules for the configured port
-- `Save Config Only`: writes config without reinstalling anything
-- `Update Server Files`: updates the dedicated server through SteamCMD
-- `Delete Server Files`: removes the configured install directory after confirmation
-
-## Status Tab
-
-This tab is used after setup is complete.
-
-It shows:
-
-- whether the server process is online or offline
-- process ID
-- uptime
-- detected server executable path
-- configured world name
-- live application log messages
-
-Buttons:
-
-- `Start Server`: launches `RSDragonwildsServer.exe`
-- `Stop Server`: terminates the detected server process
-- `Open Server Folder`: opens the install folder in Windows Explorer
-
-## How It Works
-
-At startup, the app:
-
-- loads saved app settings from `%APPDATA%\DragonwildsManager\settings.json`
-- loads server config values from existing `DedicatedServer.ini` files
-- restores the last window position
-- starts a background monitor that watches for `RSDragonwildsServer.exe`
-
-When you launch the server, the app:
-
-- resolves the server executable path
-- saves the current configuration
-- writes `DedicatedServer.ini`
-- starts the server process
-- begins monitoring it for uptime and status changes
-
-## Files And Paths
-
-Important locations used by the app:
-
-- App settings: `%APPDATA%\DragonwildsManager\settings.json`
-- Local config: `%LOCALAPPDATA%\RSDragonwilds\Saved\Config\WindowsServer\DedicatedServer.ini`
-- Built exe: `dist\DragonwildsManager.exe`
-- Default install folder: `%USERPROFILE%\DragonWildsServer`
-
-## Notes
-
-- Firewall configuration may fail unless the app is run as Administrator.
-- SteamCMD installation and updates can take several minutes.
-- The delete option permanently removes the configured install directory.
-- If you already have a server installed, use the `Existing Server Exe` field instead of reinstalling.
-
-## Development
-
-Run from source:
+## Development and verification
 
 ```powershell
-python main.py
-```
-
-Build the executable:
-
-```powershell
+python -m unittest discover -s tests -v
 python build.py
 ```
 
-## GitHub Releases
+Tests cover schedule persistence, midnight windows, occupied/unknown-player deferral, maintenance failures, archive integrity and retention, configuration preservation, streaming-process timeouts, real Windows console shutdown using a disposable helper, and UI settings/control state. They do not install, modify or stop a real Dragonwilds server. Release CI runs tests before building.
 
-The repo includes a GitHub Actions workflow at `.github/workflows/release.yml`.
+`core/ui.py` contains the interface; `core/service.py` serializes maintenance. Scheduling, Steam operations, monitoring and backups are separate modules.
 
-It will:
+## Releases and signing
 
-- build `dist\DragonwildsManager.exe` on Windows
-- upload the executable as a workflow artifact
-- attach the executable to a GitHub Release when you push a tag like `v1.0.0`
+GitHub Actions builds Windows artifacts on manual dispatch or a `v*` tag. Pushing a version tag publishes a release; local builds do not publish anything.
 
-To publish a release from GitHub:
-
-```powershell
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-You can also run the workflow manually from the GitHub Actions tab to generate a downloadable build artifact without creating a release.
-
-## Release Signing
-
-`build.py` can automatically sign `dist\DragonwildsManager.exe` when signing credentials are provided through environment variables.
-
-Supported variables:
-
-- `SIGNTOOL_PATH`: optional full path to `signtool.exe`
-- `CODESIGN_CERT_SHA1`: thumbprint of a code-signing certificate in the Windows certificate store
-- `CODESIGN_PFX_PATH`: path to a `.pfx` code-signing certificate file
-- `CODESIGN_PFX_PASSWORD`: password for the `.pfx` file
-- `CODESIGN_TIMESTAMP_URL`: optional timestamp URL override
-
-Use either `CODESIGN_CERT_SHA1` or `CODESIGN_PFX_PATH`.
-
-Example using a certificate already installed in Windows:
-
-```powershell
-$env:CODESIGN_CERT_SHA1="YOUR_CERT_THUMBPRINT"
-python build.py
-```
-
-Example using a `.pfx` file:
-
-```powershell
-$env:CODESIGN_PFX_PATH="C:\certs\codesign.pfx"
-$env:CODESIGN_PFX_PASSWORD="your-password"
-python build.py
-```
-
-If no signing variables are set, the build still succeeds, but the executable will be left unsigned.
-
-## Support
-
-If this project helped you and you want to support future updates:
-
-https://buymeacoffee.com/obietek
+`build.py` supports `SIGNTOOL_PATH`, `CODESIGN_CERT_SHA1`, `CODESIGN_PFX_PATH`, `CODESIGN_PFX_PASSWORD` and `CODESIGN_TIMESTAMP_URL` for optional signing. Without a configured certificate, the executable is unsigned.

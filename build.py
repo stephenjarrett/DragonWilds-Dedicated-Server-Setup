@@ -86,7 +86,7 @@ def main():
     # Install dependencies first
     print("\n[1/3] Installing dependencies...")
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "psutil", "pyinstaller", "--quiet"],
+        [sys.executable, "-m", "pip", "install", "-r", str(HERE / "requirements.txt"), "--quiet"],
         check=True,
     )
 
@@ -97,6 +97,7 @@ def main():
         "--onefile",                          # single exe
         "--noconsole",                        # no console window
         "--name", "DragonwildsManager",
+        "--collect-data", "customtkinter",    # themes and fonts, also in one-file extraction
         "--add-data", f"{HERE / 'core'};core",  # bundle core package
         str(HERE / "main.py"),
     ]

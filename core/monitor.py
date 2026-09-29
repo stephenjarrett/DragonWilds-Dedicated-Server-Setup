@@ -1,172 +1,201 @@
-"""
-core/monitor.py
-Watches for a running RSDragonwilds.exe process and tracks uptime.
-"""
-
+"""Exact-install process tracking and conservative player activity detection."""
+import os
 import re
-import psutil
 import subprocess
-import threading
+import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
-SERVER_EXE = "RSDragonwildsServer.exe"
-LOG_FILE = "RSDragonwilds.log"
-JOIN_RE = re.compile(r"Join succeeded:\s*(.+)")
-LEAVE_RE = re.compile(r"Player Removed from session \[[^\]]+\]-\[(.+)\]")
+import psutil
+
+JOIN = re.compile(r"Join succeeded:\s*(.+)")
+LEAVE = re.compile(r"Player Removed from session \[[^\]]+\]-\[(.+)\]")
+READY = re.compile(r"GameNetDriver.*(?:Listening|listening)|Game Engine Initialized|LogLoad:.*Took.*LoadMap")
+NAMES = {"rsdragonwildsserver.exe", "rsdragonwildsserver-win64-shipping.exe"}
+
+
+def identity(process):
+    return {"pid": process.pid, "created": process.create_time()}
+
+
+def same_process(record):
+    try:
+        process = psutil.Process(record["pid"])
+        return process if abs(process.create_time() - record["created"]) < 0.01 else None
+    except (psutil.Error, KeyError, TypeError):
+        return None
 
 
 class ServerMonitor:
-    """Polls for a running server process every N seconds."""
+    def __init__(self):
+        self.exe = ""
+        self.processes = []
+        self.players = set()
+        self.player_count_known = False
+        self.error = ""
+        self._identity = None
+        self._log_key = None
+        self._offset = 0
+        self._partial = b""
+        self.empty_since = None
 
-    def __init__(self, poll_interval: int = 3):
-        self.poll_interval = poll_interval
-        self._running = False
-        self._thread: object = None
-
-        # State
-        self.is_online = False
-        self.pid: object = None
-        self.start_time: object = None
-        self.exe_path: object = None
-        self.player_count = 0
-        self.players: set[str] = set()
-        self._log_path: Path | None = None
-        self._log_offset = 0
-
-        # Callbacks
-        self.on_status_change = None   # callable(is_online: bool)
-        self.on_tick = None            # callable() -- fires every poll cycle
-
-    # ------------------------------------------------------------------
-    def start(self):
-        if self._running:
+    def poll(self, exe):
+        self.exe = str(exe or "")
+        self.processes = []
+        self.error = ""
+        if not self.exe:
+            self._reset()
             return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-
-    # ------------------------------------------------------------------
-    def _loop(self):
-        while self._running:
-            was_online = self.is_online
-            self._poll()
-            if self.is_online != was_online and self.on_status_change:
-                self.on_status_change(self.is_online)
-            if self.on_tick:
-                self.on_tick()
-            time.sleep(self.poll_interval)
-
-    def _poll(self):
-        for proc in psutil.process_iter(["pid", "name", "exe", "create_time"]):
+        selected = Path(self.exe).resolve()
+        for process in psutil.process_iter(["name", "exe", "create_time"]):
             try:
-                if proc.info["name"] and SERVER_EXE.lower() in proc.info["name"].lower():
-                    if not self.is_online:
-                        self.start_time = datetime.fromtimestamp(proc.info["create_time"])
-                        self.exe_path   = proc.info.get("exe", "")
-                        self._reset_player_tracking()
-                    elif self.exe_path != proc.info.get("exe", ""):
-                        self.exe_path = proc.info.get("exe", "")
-                        self._reset_player_tracking()
-                    self.is_online = True
-                    self.pid       = proc.info["pid"]
-                    self._update_player_count()
-                    return
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                name = (process.info["name"] or "").casefold()
+                if name not in NAMES and name != selected.name.casefold():
+                    continue
+                executable = process.info.get("exe")
+                if not executable:
+                    self.error = "Cannot read a server process path; run with matching permissions."
+                    continue
+                path = Path(executable).resolve()
+                if path == selected or (path.is_relative_to(selected.parent) and name in NAMES):
+                    self.processes.append(process)
+            except psutil.NoSuchProcess:
                 continue
-        # Not found
-        self.is_online  = False
-        self.pid        = None
-        self.start_time = None
-        self.exe_path   = None
-        self.player_count = 0
+            except psutil.AccessDenied:
+                self.error = "Server process access denied."
+        self.processes.sort(key=lambda p: p.create_time())
+        current = tuple((p.pid, p.create_time()) for p in self.processes)
+        if current != self._identity:
+            self._reset()
+            self._identity = current
+        if self.processes:
+            self._read_players()
+        else:
+            self._reset()
+        if self.processes and self.player_count_known and not self.players:
+            self.empty_since = self.empty_since or time.time()
+        else:
+            self.empty_since = None
+
+    def _reset(self):
         self.players.clear()
-        self._log_path = None
-        self._log_offset = 0
+        self.player_count_known = False
+        self._log_key = None
+        self._offset = 0
+        self._partial = b""
+        self.empty_since = None
 
-    def _reset_player_tracking(self):
-        self.player_count = 0
-        self.players.clear()
-        self._log_path = None
-        self._log_offset = 0
-
-    def _candidate_log_paths(self) -> list[Path]:
-        if not self.exe_path:
-            return []
-        base = Path(self.exe_path).parent
-        return [
-            base / "RSDragonwilds" / "Saved" / "Logs" / LOG_FILE,
-            base / "Saved" / "Logs" / LOG_FILE,
-        ]
-
-    def _update_player_count(self):
-        if not self._log_path:
-            for candidate in self._candidate_log_paths():
-                if candidate.exists():
-                    self._log_path = candidate
-                    break
-
-        if not self._log_path or not self._log_path.exists():
-            self.player_count = len(self.players)
-            return
-
+    def _read_players(self):
+        base = Path(self.exe).parent
+        paths = [base / "RSDragonwilds/Saved/Logs/RSDragonwilds.log", base / "Saved/Logs/RSDragonwilds.log"]
         try:
-            size = self._log_path.stat().st_size
-            if size < self._log_offset:
-                self._log_offset = 0
-                self.players.clear()
+            available = [path for path in paths if path.is_file()]
+            if not available:
+                self.player_count_known = False
+                return
+            path = max(available, key=lambda p: p.stat().st_mtime_ns)
+            stat = path.stat()
+            if stat.st_mtime < min(p.create_time() for p in self.processes):
+                self.player_count_known = False
+                return
+            key = (str(path), stat.st_ino, stat.st_ctime_ns)
+            if key != self._log_key or stat.st_size < self._offset:
+                self._reset()
+                self._log_key = key
+            with path.open("rb") as stream:
+                stream.seek(self._offset)
+                data = self._partial + stream.read()
+                self._offset = stream.tell()
+            lines = data.split(b"\n")
+            self._partial = lines.pop()
+            for raw in lines:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if READY.search(line):
+                    self.player_count_known = True
+                joined, left = JOIN.search(line), LEAVE.search(line)
+                if joined:
+                    self.players.add(joined.group(1).strip())
+                elif left:
+                    self.players.discard(left.group(1).strip())
+        except (OSError, psutil.Error):
+            self.player_count_known = False
 
-            with self._log_path.open("r", encoding="utf-8", errors="ignore") as fh:
-                fh.seek(self._log_offset)
-                for line in fh:
-                    self._process_log_line(line.strip())
-                self._log_offset = fh.tell()
-        except OSError:
-            return
-
-        self.player_count = len(self.players)
-
-    def _process_log_line(self, line: str):
-        joined = JOIN_RE.search(line)
-        if joined:
-            self.players.add(joined.group(1).strip())
-            return
-
-        left = LEAVE_RE.search(line)
-        if left:
-            self.players.discard(left.group(1).strip())
-
-    # ------------------------------------------------------------------
-    @property
-    def uptime_str(self) -> str:
-        if not self.is_online or self.start_time is None:
-            return "--"
-        delta = datetime.now() - self.start_time
-        h, rem = divmod(int(delta.total_seconds()), 3600)
-        m, s   = divmod(rem, 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
-
-    def kill(self) -> bool:
-        """Terminate the server process tree. Returns True on success."""
-        if self.pid is None:
-            return False
+    def snapshot(self):
         try:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(self.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                return True
+            created = min((p.create_time() for p in self.processes), default=None)
+            return {"online": bool(self.processes), "pids": [p.pid for p in self.processes],
+                    "started": created, "players": sorted(self.players),
+                    "players_known": self.player_count_known, "empty_since": self.empty_since,
+                    "monitor_error": self.error}
+        except psutil.Error:
+            return {"online": False, "pids": [], "started": None, "players": [],
+                    "players_known": False, "empty_since": None, "monitor_error": "Process changed; refreshing."}
 
-            proc = psutil.Process(self.pid)
-            proc.terminate()
-            proc.wait(timeout=5)
-            return True
-        except (psutil.NoSuchProcess, psutil.TimeoutExpired, psutil.AccessDenied, subprocess.SubprocessError):
-            return False
+
+def launch(exe):
+    if not Path(exe).is_file():
+        raise RuntimeError("Server executable not found. Choose it in Server settings or run Install / repair.")
+    options = {}
+    if os.name == "nt":
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = subprocess.SW_HIDE
+        options = {"creationflags": subprocess.CREATE_NEW_CONSOLE, "startupinfo": startup}
+    child = subprocess.Popen([str(Path(exe).resolve()), "-log", "-NewConsole"],
+                             cwd=Path(exe).resolve().parent, **options)
+    return identity(psutil.Process(child.pid))
+
+
+def signal_console(pid):
+    """Used only in a short-lived helper attached to a manager-owned console."""
+    import ctypes
+    kernel = ctypes.windll.kernel32
+    kernel.FreeConsole()
+    if not kernel.AttachConsole(int(pid)):
+        return 1
+    kernel.SetConsoleCtrlHandler(None, True)
+    success = kernel.GenerateConsoleCtrlEvent(0, 0)
+    time.sleep(0.75)
+    kernel.FreeConsole()
+    return 0 if success else 1
+
+
+def stop(mon, owned, allow_force, log, timeout=30):
+    processes = list(mon.processes)
+    if not processes:
+        return
+    records = [identity(p) for p in processes]
+    descendants = []
+    for process in processes:
+        try:
+            descendants.extend(identity(child) for child in process.children(recursive=True))
+        except psutil.NoSuchProcess:
+            pass
+    records.extend(descendants)
+    console_target = next((p for p in reversed(processes) if any(
+        p.pid == record.get("pid") and same_process(record) is not None for record in owned)), None)
+    signalled = False
+    if console_target and os.name == "nt":
+        entry = [] if getattr(sys, "frozen", False) else [str(Path(__file__).resolve().parents[1] / "main.py")]
+        helper = subprocess.run([sys.executable, *entry, "--signal-stop", str(console_target.pid)],
+                                creationflags=subprocess.CREATE_NO_WINDOW, timeout=20, capture_output=True)
+        signalled = helper.returncode == 0
+    if signalled:
+        log("Requested a console shutdown; waiting for the server to exit...", "INFO")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and any(same_process(record) for record in records):
+            time.sleep(0.25)
+    alive = [process for record in records if (process := same_process(record))]
+    if alive and not allow_force:
+        raise RuntimeError("Server did not stop. Maintenance cancelled. Stop it manually, or enable forced stops in Automation.")
+    if alive:
+        log("Using the enabled forced-stop fallback; unsaved in-memory progress may be lost.", "WARN")
+        for process in reversed(alive):
+            try:
+                process.kill()
+            except psutil.NoSuchProcess:
+                pass
+        _, remaining = psutil.wait_procs(alive, timeout=15)
+        if remaining:
+            raise RuntimeError("Server processes are still running. Maintenance cancelled.")
+    log("Server process tree has stopped.", "OK")
