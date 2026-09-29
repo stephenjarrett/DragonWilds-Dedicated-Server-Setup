@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw
 from core import installer, scheduler, settings
 from core.service import ManagerService
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 C = {"bg": "#292B30", "sidebar": "#202226", "panel": "#24262B", "input": "#1D1F23",
      "border": "#3A3D45", "text": "#F2F3F7", "muted": "#A2A6B3", "accent": "#8278F7",
      "accent_dark": "#343044", "warn": "#E9BE75", "error": "#EF969F", "blue": "#B5B0FC",
@@ -108,9 +108,17 @@ class DragonwildsManager(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind_all("<MouseWheel>", self._scroll)
         self.bind("<Control-s>", lambda e: self._save())
+        # Realize and paint the widget tree while hidden. Windows can then
+        # present the controls together on first show and after restoring.
+        self.update_idletasks()
+        self._prepare_native_window()
+        self._restore_pending = False
+        self._restore_job = None
+        if os.name == "nt":
+            self.bind("<Unmap>", self._on_window_unmap, add="+")
+            self.bind("<Expose>", self._on_window_expose, add="+")
         if show_window:
             self.deiconify()
-            self.after(120, self._dark_titlebar)
             if minimized:
                 self.after(100, self.iconify)
 
@@ -141,12 +149,56 @@ class DragonwildsManager(tk.Tk):
         label(parent, title, size=22, bold=True).pack(anchor="w", pady=(4, 6))
         label(parent, description, color="muted", wraplength=760, justify="left").pack(anchor="w", pady=(0, 24))
 
-    def _dark_titlebar(self):
-        if os.name == "nt":
-            import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            enabled = ctypes.c_int(1)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(enabled), 4)
+    def _prepare_native_window(self):
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        hwnd = user32.GetParent(self.winfo_id())
+        if not hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        # Ask Tk to keep a Windows layered backing surface for the whole
+        # window, preventing intermediate child-widget paints on restore.
+        # Tk retains WS_EX_LAYERED when alpha returns to 1; both calls happen
+        # while hidden, and the displayed window is fully opaque. Avoid
+        # WS_EX_COMPOSITED, which clips Tk's embedded scrollable canvases.
+        # Tk's implementation: win/tkWinWm.c, WmAttributesCmd.
+        self.attributes("-alpha", 0.999)
+        self.attributes("-alpha", 1.0)
+
+        dwm = ctypes.WinDLL("dwmapi")
+        dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+        enabled = wintypes.BOOL(True)
+        dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
+
+    def _on_window_unmap(self, event):
+        if event.widget is self and self.state() == "iconic":
+            # Windows discards child surfaces while minimized. Keep their
+            # unpainted black rectangles out of the first restored frame.
+            self._restore_pending = True
+            self.attributes("-alpha", 0.0)
+
+    def _on_window_expose(self, event):
+        if event.widget is self and self._restore_pending and self._restore_job is None:
+            self._restore_job = self.after_idle(self._finish_restore)
+
+    def _finish_restore(self):
+        self._restore_job = None
+        if self.state() not in ("normal", "zoomed"):
+            return
+        # Expose arrives after Map and queues Tk's repaints as idle work. Flush those
+        # paints before revealing the window, without running a nested mainloop,
+        # recreating controls, changing focus or resetting any form values.
+        self.update_idletasks()
+        if self.state() in ("normal", "zoomed"):
+            self._restore_pending = False
+            self.attributes("-alpha", 1.0)
 
     def _build(self):
         sidebar = tk.Frame(self, bg=C["sidebar"], width=218)
